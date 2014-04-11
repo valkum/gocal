@@ -73,8 +73,8 @@ func main() {
     v.Set("p", *password)
     v.Set("u", *username)
 
-    request("post", baseUrl + loginPath, client, v)
-    // resp, head, _ = request("post", baseUrl + loginPath, client, v)
+    // request("post", baseUrl + loginPath, client, v)
+    _, head, _ = request("post", baseUrl + loginPath, client, v)
     // spew.Dump(head)
     // fmt.Printf("%s\n", resp)
     startDate := time.Now()
@@ -107,7 +107,7 @@ func main() {
     // close fo on exit and check for its returned error
     defer func() {
         if err := fo.Close(); err != nil {
-            panic(err)
+            log.Fatal(err)
         }
     }()
     w := bufio.NewWriter(fo)
