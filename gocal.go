@@ -3,15 +3,21 @@ package main
 import (
     "fmt"
     "strings"
-    // "bytes"
-    //"encoding/xml"
+    "bufio"
+    // "strconv"
     "net/http"
     // "net/http/cookiejar"
     "net/url"
     "flag"
-    "strconv"
     "io/ioutil"
+    "regexp"
     "time"
+    "unicode/utf8"
+    "log"
+    "os"
+    "database/sql"
+    _ "github.com/mattn/go-sqlite3"
+    mahonia "github.com/axgle/mahonia"
     spew "github.com/davecgh/go-spew/spew"
 )
 
@@ -23,37 +29,26 @@ var calPath = "office/views/calendar/iCalExport.asp"
 var logoutPath = "office/system/login/logoff.asp"
 var roomPath = "rwth/all/room.asp"
 
-type myCookieJar struct {
-    cookies []*http.Cookie
+
+type Room struct {
+    id          string
+    address     string
+    cluster     string
+    building    string
+    building_no string
+    room        string
+    room_no     string
+    floor       string
 }
 
-func (c *myCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
-    // spew.Dump(u, cookies)
-    if c.cookies == nil {
-        c.cookies = make([]*http.Cookie, 0)
-    }
 
-    for _, it := range cookies {
-        c.cookies = append(c.cookies, it)
-    }
-}
-
-func (c *myCookieJar) Cookies(u *url.URL) []*http.Cookie {
-    // spew.Dump(c)
-    return c.cookies
-}
-
-func testLog (req *http.Request, via []*http.Request) error {
-    // spew.Dump(req)
-    // spew.Dump(via)
-    return nil
-}
 var cookieJar *myCookieJar
+var client *http.Client
 func main() {
     //cookieJar, _ := cookiejar.New(nil)
     cookieJar = &myCookieJar{}
-    client := &http.Client{
-        // Jar: cookieJar,
+    client = &http.Client{
+        Jar: cookieJar,
         // CheckRedirect : testLog,
     }
 
@@ -64,37 +59,123 @@ func main() {
       flag.PrintDefaults()
     }
     flag.Parse()
-    //if flag.NFlag() != 2 {
-    //    flag.Usage()
-    //    return
-    //}
+    if flag.NFlag() != 2 {
+       flag.Usage()
+       return
+    }
     //fmt.Printf("Loggin in with %s:%s\n", *username, *password)
-    // var resp string
+    var resp string
     // var head http.Header
     request("get", baseUrl + homePath, client, nil)
-    // fmt.Printf("\n", head)
+    // spew.Dump("\n", head)
     v := url.Values{}
     v.Set("login", "> Login")
     v.Set("p", *password)
     v.Set("u", *username)
-    v.Set("regwaygguid","")
-    v.Set("evgguid","")
 
-    // request("post", baseUrl + loginPath, client, v)
-    resp, head, _ := request("post", baseUrl + loginPath, client, v)
-    spew.Dump(head)
-    fmt.Printf("%s\n", resp)
+    request("post", baseUrl + loginPath, client, v)
+    // resp, head, _ = request("post", baseUrl + loginPath, client, v)
+    // spew.Dump(head)
+    // fmt.Printf("%s\n", resp)
     startDate := time.Now()
     startDate = startDate.AddDate(0, 0, -7)
     endDate := time.Now()
     endDate = endDate.AddDate(0, 6, 0)
     v = url.Values{}
-    v.Set("stadtdt", startDate.Format("02.01.2006"))
+    v.Set("startdt", startDate.Format("02.01.2006"))
     v.Set("enddt", endDate.Format("02.01.2006"))
 
-    // request("get", baseUrl + calPath, client, v)
-    //fmt.Printf("\n", resp)
+    resp, _, _ = request("get", baseUrl + calPath, client, v)
+    // fmt.Printf("%s\n", resp)
+    // fmt.Println(resp)
 
+    db, err := sql.Open("sqlite3", "./foo.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+    _, err = db.Exec("CREATE TABLE IF NOT EXISTS rooms (id VARCHAR(255) PRIMARY KEY, address VARCHAR(255), cluster VARCHAR(255), building VARCHAR(255), building_no INTEGER, room VARCHAR(255), room_no INTEGER, floor VARCHAR(255))")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // open output file
+    fo, err := os.Create("C:/Users/valkum/Dropbox/public/318099.ics")
+    if err != nil {
+        log.Fatal(err)
+    }
+    // close fo on exit and check for its returned error
+    defer func() {
+        if err := fo.Close(); err != nil {
+            panic(err)
+        }
+    }()
+    w := bufio.NewWriter(fo)
+
+    var address Room
+    var category string
+    lines := strings.Split(resp, "\r\n")
+    for _,line := range lines {
+        if len(strings.TrimSpace(line)) != 0 {
+            if j := strings.Index(line, ":"); j >= 0 {
+                key, value := line[:j], line[j+1:]
+                switch key {
+                case "END":
+                    if value == "VEVENT" {
+                        address = Room{}
+                        category = ""
+                    }
+                    break
+                case "CATEGORIES":
+                    category = value
+                    break
+                case "LOCATION":
+                    var reg = regexp.MustCompile(`^([0-9]+\|[0-9]+)`)
+                    if matches := reg.FindAllString(value, -1); len(matches) != 0 {
+                        room := matches[0]
+                        address = get_address(db, room)
+
+                        if address == (Room{}) {
+                            fmt.Println("no address found")
+                            address = crawl_address(room)
+                            set_address(db, room, address)
+                        }
+
+                        if address.address != "" {
+                            value = address.address + ", Aachen"
+                        }
+
+                    }
+                    break
+                case "DESCRIPTION":
+                    additional := value
+                    value = ""
+                    if address.building != "" || address.building_no != "" {
+                        value += "\nGebäude: " +  address.building_no + " " + address.building
+                    }
+                    if address.room != "" || address.room_no != "" {
+                        value += "\nRaum: " +  address.room_no + " " + address.room
+                    }
+                    if address.floor != "" {
+                        value += "\nGeschoss: " +  address.floor
+                    }
+                    if address.cluster != "" {
+                        value += "\nCampus: " +  address.floor
+                    }
+                    if category != "" {
+                        value += "\nTyp: " + category
+                    }
+                    if additional != "" && additional != "Kommentar" {
+                        value += "\n"+additional
+                    }
+                    break
+                }
+                fmt.Fprint(w, key + ":" + strings.TrimSpace(value))
+            }
+        }
+        fmt.Fprint(w, "\r\n")
+    }
+    w.Flush()
 }
 
 
@@ -107,17 +188,18 @@ func request(method string, url string, cl *http.Client, params url.Values) (str
 
     if(method == "post") {
         req, err = http.NewRequest("POST", url, strings.NewReader(params.Encode()))
-        req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-    } else if(method == "get") {
+        req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+    } else {
         req, err = http.NewRequest("GET", url + "?" + params.Encode(), nil)
     }
-    req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/34.0.1847.116 Safari/537.36")
-    req.Header.Add("Host", "www.campus.rwth-aachen.de")
-    req.Header.Add("Origin", baseUrl + )
-    for _, c := range cookieJar.cookies {
-        req.AddCookie(c)
-    }
-    spew.Dump(req)
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/34.0.1847.116 Safari/537.36")
+    req.Header.Set("Origin", "www.campus.rwth-aachen.de")
+    req.Header.Set("Referer", "https://www.campus.rwth-aachen.de/office/views/campus/redirect.asp")
+    req.Header.Set("Accept-Language", "de-DE,de;q=0.8,en-US;q=0.6,en;q=0.4")
+    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+    // for _, c := range cookieJar.cookies {
+    //     req.AddCookie(c)
+    // }
 
     var resp *http.Response
     resp, err = cl.Do(req)
@@ -135,10 +217,12 @@ func request(method string, url string, cl *http.Client, params url.Values) (str
     var bodyString string
     //var err2 error
     if resp.StatusCode == 200 { // OK
-        bodyBytes, err2 := ioutil.ReadAll(resp.Body)
-        bodyString = string(bodyBytes)
-        if err2 != nil {
-            fmt.Printf("Error from ioutil.ReadAll: %s\n", err2)
+        bodyBytes, _ := ioutil.ReadAll(resp.Body)
+        if utf8.Valid(bodyBytes) {
+            bodyString = string(bodyBytes)
+        } else {
+            enc := mahonia.NewDecoder("latin-1")
+            bodyString = enc.ConvertString(string(bodyBytes))
         }
     }
 
@@ -146,6 +230,82 @@ func request(method string, url string, cl *http.Client, params url.Values) (str
 
 }
 
+func get_address (db *sql.DB, r string) (result Room) {
+    stmt, err := db.Prepare("SELECT * FROM rooms WHERE id = ?")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer stmt.Close()
+    result = Room{}
+    err = stmt.QueryRow(r).Scan(&result.id, &result.address, &result.cluster, &result.building, &result.building_no, &result.room, &result.room_no, &result.floor)
+    if err != nil {
+        log.Fatalf("Error running %q: %v", stmt, err)
+        spew.Dump(stmt)
+    }
+    return result
+}
+func set_address (db *sql.DB, room string, address Room) {
+    stmt, err := db.Prepare("INSERT OR REPLACE INTO rooms (id, address, cluster, building, building_no, room, room_no, floor) values (?, ?, ?, ?, ?, ?, ?, ?)")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer stmt.Close()
+    _, err = stmt.Exec(room, address.address, address.cluster, address.building, address.building_no, address.room, address.room_no, address.floor)
+    if err != nil {
+        log.Fatal(err)
+    }
+    return
+}
+
+func crawl_address (room string) (matches Room) {
+    resp, _, _ := request("GET", baseUrl + roomPath, client, url.Values{"room": {room}})
+
+    infos := map[string]string{
+    "cluster" : "H.rsaalgruppe",
+    "address" : "Geb.udeanschrift",
+    "building" : "Geb.udebezeichnung",
+    "building_no" : "Geb.udenummer",
+    "room" : "Raumname",
+    "room_no" : "Raumnummer",
+    "floor" : "Geschoss",
+    }
+
+    for index, pattern := range infos {
+        re := regexp.MustCompile("<td class=\"default\">" + pattern + "</td><td class=\"default\">([^<]*)</td>")
+        match := re.FindStringSubmatch(resp);
+        if ( len(match) != 0) {
+            if matches == (Room{}) {
+                matches = Room{}
+            }
+            re := regexp.MustCompile("/[ ]{2,}/sm")
+            switch index {
+            case "cluster":
+                matches.cluster = re.ReplaceAllString(match[1], " ")
+                break
+            case "address":
+                matches.address = re.ReplaceAllString(match[1], " ")
+                break
+            case "building":
+                matches.building = re.ReplaceAllString(match[1], " ")
+                break
+            case "building_no":
+                matches.building_no = re.ReplaceAllString(match[1], " ")
+                break
+            case "room":
+                matches.room = re.ReplaceAllString(match[1], " ")
+                break
+            case "room_no":
+                matches.room_no = re.ReplaceAllString(match[1], " ")
+                break
+            case "floor":
+                matches.floor = re.ReplaceAllString(match[1], " ")
+                break
+            }
+        }
+    }
+
+    return matches
+}
 
 // func fix_cookies(jar *cookiejar.Jar) {
 //     u, _ := url.Parse(baseUrl + "office")
@@ -163,141 +323,4 @@ func request(method string, url string, cl *http.Client, params url.Values) (str
 
 
 
-// readSetCookies parses all "Set-Cookie" values from
-// the header h and returns the successfully parsed Cookies.
-func readSetCookies(h http.Header) []*http.Cookie {
-    cookies := []*http.Cookie{}
-    for _, line := range h["Set-Cookie"] {
-        // fmt.Println("test")
-        parts := strings.Split(strings.TrimSpace(line), ";")
-        if len(parts) == 1 && parts[0] == "" {
-            continue
-        }
-        // fmt.Println("Empty check passed")
-        parts[0] = strings.TrimSpace(parts[0])
-        j := strings.Index(parts[0], "=")
-        if j < 0 {
-            continue
-        }
-        name, value := parts[0][:j], parts[0][j+1:]
-        if !isCookieNameValid(name) {
-            continue
-        }
-        // fmt.Println("isValidName")
-        value, success := parseCookieValue(value)
-        if !success {
-            continue
-        }
-        // fmt.Printf("value parsed for %s\n", name)
-        c := &http.Cookie{
-            Name:  name,
-            Value: value,
-            Raw:   line,
-        }
-        for i := 1; i < len(parts); i++ {
-            parts[i] = strings.TrimSpace(parts[i])
-            if len(parts[i]) == 0 {
-                continue
-            }
 
-            attr, val := parts[i], ""
-            if j := strings.Index(attr, "="); j >= 0 {
-                attr, val = attr[:j], attr[j+1:]
-            }
-            lowerAttr := strings.ToLower(attr)
-            parseCookieValueFn := parseCookieValue
-            if lowerAttr == "expires" {
-                parseCookieValueFn = parseCookieExpiresValue
-            }
-            val, success = parseCookieValueFn(val)
-            if !success {
-                c.Unparsed = append(c.Unparsed, parts[i])
-                continue
-            }
-            switch lowerAttr {
-            case "secure":
-                c.Secure = true
-                continue
-            case "httponly":
-                c.HttpOnly = true
-                continue
-            case "domain":
-                c.Domain = val
-                // TODO: Add domain parsing
-                continue
-            case "max-age":
-                secs, err := strconv.Atoi(val)
-                if err != nil || secs != 0 && val[0] == '0' {
-                    break
-                }
-                if secs <= 0 {
-                    c.MaxAge = -1
-                } else {
-                    c.MaxAge = secs
-                }
-                continue
-            case "expires":
-                c.RawExpires = val
-                exptime, err := time.Parse(time.RFC1123, val)
-                if err != nil {
-                    exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)
-                    if err != nil {
-                        c.Expires = time.Time{}
-                        break
-                    }
-                }
-                c.Expires = exptime.UTC()
-                continue
-            case "path":
-                c.Path = val
-                // TODO: Add path parsing
-                continue
-            }
-            c.Unparsed = append(c.Unparsed, parts[i])
-        }
-        cookies = append(cookies, c)
-    }
-    return cookies
-}
-
-
-func isCookieExpiresByte(c byte) (ok bool) {
-    return isCookieByte(c) || c == ',' || c == ' '
-}
-
-func parseCookieValue(raw string) (string, bool) {
-    return parseCookieValueUsing(raw, isCookieByte)
-}
-
-func parseCookieExpiresValue(raw string) (string, bool) {
-    return parseCookieValueUsing(raw, isCookieExpiresByte)
-}
-
-func parseCookieValueUsing(raw string, validByte func(byte) bool) (string, bool) {
-    raw = unquoteCookieValue(raw)
-    for i := 0; i < len(raw); i++ {
-        if !validByte(raw[i]) {
-            return "", false
-        }
-    }
-    return raw, true
-}
-
-func isCookieNameValid(raw string) bool {
-    return true
-}
-func isCookieByte(c byte) bool {
-    switch {
-    case c == 0x21, 0x23 <= c && c <= 0x2b, 0x2d <= c && c <= 0x3a,
-        0x3c <= c && c <= 0x5b, 0x5d <= c && c <= 0x7e:
-        return true
-    }
-    return false
-}
-
-func unquoteCookieValue(v string) string {
-    if len(v) > 1 && v[0] == '"' && v[len(v)-1] == '"' {
-        return v[1 : len(v)-1]
-    }
-    return v
-}
