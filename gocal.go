@@ -1,25 +1,20 @@
 package main
 
 import (
-    "fmt"
-    "strings"
-    "bufio"
-    // "strconv"
-    "net/http"
-    // "net/http/cookiejar"
-    "net/url"
-    "flag"
-    "io/ioutil"
-    "regexp"
-    "time"
-    "unicode/utf8"
-    "log"
-    "os"
-    "database/sql"
-    _ "github.com/mattn/go-sqlite3"
-    mahonia "github.com/axgle/mahonia"
-    spew "github.com/davecgh/go-spew/spew"
-)
+  "fmt"
+  "strings"
+  "bufio"
+  "database/sql"
+  "net/http"
+  "net/url"
+  "io/ioutil"
+  "regexp"
+  "time"
+  "unicode/utf8"
+  "log"
+  "os"
+  gopass "github.com/howeyc/gopass"
+  mahonia "github.com/axgle/mahonia")
 
 var baseUrl = "https://www.campus.rwth-aachen.de/"
 var baseUrlHttp = "http://www.campus.rwth-aachen.de/"
@@ -28,156 +23,265 @@ var loginPath = "office/views/campus/redirect.asp"
 var calPath = "office/views/calendar/iCalExport.asp"
 var logoutPath = "office/system/login/logoff.asp"
 var roomPath = "rwth/all/room.asp"
+var version = "0.1"
 
 
 type Room struct {
-    id          string
-    address     string
-    cluster     string
-    building    string
-    building_no string
-    room        string
-    room_no     string
-    floor       string
+  id          string
+  address     string
+  cluster     string
+  building    string
+  building_no string
+  room        string
+  room_no     string
+  floor       string
 }
 
+var db *Database
+var e *Encryption
 
 var cookieJar *myCookieJar
 var client *http.Client
+
 func main() {
-    //cookieJar, _ := cookiejar.New(nil)
-    cookieJar = &myCookieJar{}
-    client = &http.Client{
-        Jar: cookieJar,
-        // CheckRedirect : testLog,
+  start()
+  defer db.conn.Close()
+  args :=  os.Args[1:len(os.Args)]
+  for  _,arg := range args {
+    if (arg == "-h" || arg == "--help") {
+      fmt.Println("Usage: gocal [TASK]")
+      fmt.Println("Lädt deinen CampusOffice Kalender in den gespeicherten Ordner und fügt Rauminformationen hinzu.")
+      fmt.Println("Ähntlich zu dem Onlinetool CoCal")
+      fmt.Println("Tasks: ")
+      fmt.Printf("   setup \tRichtet goCal ein\n")
+      fmt.Printf("   run \tLädt deinen Kalender runter\n")
+      fmt.Println()
+      fmt.Println()
+      fmt.Printf("goCal version: %s", version)
+      os.Exit(0)
+    } else if (arg == "-v" || arg == "--version") {
+      fmt.Printf("goCal version: %s", version)
+      os.Exit(0)
+    } else {
+      switch (arg) {
+        case "setup":
+          setup()
+          break
+        case "run":
+          calendar()
+          break;
+        default:
+          fmt.Printf("Unbekannter Befehel: gocal %s\n", arg)
+      }
     }
-
-    username := flag.String("username", "", "MTR #")
-    password := flag.String("password", "", "Password")
-    flag.Usage=func() {
-      fmt.Printf("Syntax:\n\tgocal [flags]\nwhere flags are:\n")
-      flag.PrintDefaults()
-    }
-    flag.Parse()
-    if flag.NFlag() != 2 {
-       flag.Usage()
-       return
-    }
-    //fmt.Printf("Loggin in with %s:%s\n", *username, *password)
-    var resp string
-    // var head http.Header
-    request("get", baseUrl + homePath, client, nil)
-    // spew.Dump("\n", head)
-    v := url.Values{}
-    v.Set("login", "> Login")
-    v.Set("p", *password)
-    v.Set("u", *username)
-
-    // request("post", baseUrl + loginPath, client, v)
-    _, head, _ = request("post", baseUrl + loginPath, client, v)
-    // spew.Dump(head)
-    // fmt.Printf("%s\n", resp)
-    startDate := time.Now()
-    startDate = startDate.AddDate(0, 0, -7)
-    endDate := time.Now()
-    endDate = endDate.AddDate(0, 6, 0)
-    v = url.Values{}
-    v.Set("startdt", startDate.Format("02.01.2006"))
-    v.Set("enddt", endDate.Format("02.01.2006"))
-
-    resp, _, _ = request("get", baseUrl + calPath, client, v)
-    // fmt.Printf("%s\n", resp)
-    // fmt.Println(resp)
-
-    db, err := sql.Open("sqlite3", "./foo.db")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
-    _, err = db.Exec("CREATE TABLE IF NOT EXISTS rooms (id VARCHAR(255) PRIMARY KEY, address VARCHAR(255), cluster VARCHAR(255), building VARCHAR(255), building_no INTEGER, room VARCHAR(255), room_no INTEGER, floor VARCHAR(255))")
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // open output file
-    fo, err := os.Create("C:/Users/valkum/Dropbox/public/318099.ics")
-    if err != nil {
-        log.Fatal(err)
-    }
-    // close fo on exit and check for its returned error
-    defer func() {
-        if err := fo.Close(); err != nil {
-            log.Fatal(err)
-        }
-    }()
-    w := bufio.NewWriter(fo)
-
-    var address Room
-    var category string
-    lines := strings.Split(resp, "\r\n")
-    for _,line := range lines {
-        if len(strings.TrimSpace(line)) != 0 {
-            if j := strings.Index(line, ":"); j >= 0 {
-                key, value := line[:j], line[j+1:]
-                switch key {
-                case "END":
-                    if value == "VEVENT" {
-                        address = Room{}
-                        category = ""
-                    }
-                    break
-                case "CATEGORIES":
-                    category = value
-                    break
-                case "LOCATION":
-                    var reg = regexp.MustCompile(`^([0-9]+\|[0-9]+)`)
-                    if matches := reg.FindAllString(value, -1); len(matches) != 0 {
-                        room := matches[0]
-                        address = get_address(db, room)
-
-                        if address == (Room{}) {
-                            fmt.Println("no address found")
-                            address = crawl_address(room)
-                            set_address(db, room, address)
-                        }
-
-                        if address.address != "" {
-                            value = address.address + ", Aachen"
-                        }
-
-                    }
-                    break
-                case "DESCRIPTION":
-                    additional := value
-                    value = ""
-                    if address.building != "" || address.building_no != "" {
-                        value += "\nGebäude: " +  address.building_no + " " + address.building
-                    }
-                    if address.room != "" || address.room_no != "" {
-                        value += "\nRaum: " +  address.room_no + " " + address.room
-                    }
-                    if address.floor != "" {
-                        value += "\nGeschoss: " +  address.floor
-                    }
-                    if address.cluster != "" {
-                        value += "\nCampus: " +  address.floor
-                    }
-                    if category != "" {
-                        value += "\nTyp: " + category
-                    }
-                    if additional != "" && additional != "Kommentar" {
-                        value += "\n"+additional
-                    }
-                    break
-                }
-                fmt.Fprint(w, key + ":" + strings.TrimSpace(value))
-            }
-        }
-        fmt.Fprint(w, "\r\n")
-    }
-    w.Flush()
+  }
+  if(len(args) == 0) {
+    calendar()
+  }
 }
 
+func start() {
+  cookieJar = &myCookieJar{}
+  client = &http.Client{
+      Jar: cookieJar,
+  }
+  db = database()
+  db.init()
+  e = encryption()
+}
+
+func setup() {
+  var dir string
+  var username string
+  var password []byte
+
+  fmt.Println("Setup")
+  fmt.Println("--------------------")
+  fmt.Println("Bitte gib deine CampusOffice daten ein.")
+  fmt.Println("Deine Zugangsdaten werden verschlüsselt auf deinem Computer abgelegt.")
+
+  fmt.Printf("MatrNr: ")
+  fmt.Scanln(&username)
+  fmt.Printf("Passwort: ")
+  password = gopass.GetPasswdMasked()
+
+
+  for !login(string(username), string(password)) {
+    fmt.Println("Falche MatrNr oder falsches Passwort!")
+
+    fmt.Printf("MatrNr: ")
+    fmt.Scanln(&username)
+    fmt.Printf("Passwort: ")
+    password = gopass.GetPasswdMasked()
+  }
+
+  fmt.Println("Erfolgreich eingeloggt")
+  db.set_encrypted_setting(e, "username", username)
+  db.set_encrypted_setting(e, "password", string(password))
+
+  fmt.Println("Bitte gib den Speicherort an, an dem deine iCal exportiert werden soll.")
+  fmt.Println("Beispiele:")
+  fmt.Println("Windows: C:\\Users\\Benutzer\\Dropbox")
+  fmt.Println("Linux: /home/Benutzer/Dropbox")
+
+  fmt.Printf("Speicherort: ")
+  fmt.Scanln(&dir)
+
+  _, err := os.Stat(dir)
+  for (err != nil) {
+    if os.IsNotExist(err) {
+        log.Print(err)
+        fmt.Printf("Der Speicherort %s existiert nicht.\n", dir)
+        fmt.Println("Bitte gibt einen gültigen Speicherort an")
+    } else {
+        fmt.Println("Es ist ein Fehler aufgetreten.")
+        fmt.Println("Bist du sicher, dass du Zugriffsberechtigungn auf diesen Ordner hast?")
+    }
+    fmt.Printf("Speicherort: ")
+    fmt.Scanln(&dir)
+    _, err = os.Stat(dir)
+  }
+  db.set_setting("dir", dir)
+
+  db.set_setting("setup", "1")
+  fmt.Println("Setup abgeschlossen")
+}
+
+func login(username string, password string) bool {
+  request("get", baseUrl + homePath, client, nil)
+  v := url.Values{}
+  v.Set("login", "> Login")
+  v.Set("p", password)
+  v.Set("u", username)
+
+  var resp string
+  // request("post", baseUrl + loginPath, client, v)
+  resp, _, _ = request("post", baseUrl + loginPath, client, v)
+
+  re := regexp.MustCompile("timeTable\\.asp")
+  match := re.FindStringIndex(resp);
+  if match == nil {
+    return false
+  } else  {
+    return true
+  }
+}
+
+func calendar() {
+  s, err := db.get_setting("setup")
+  if s != "1" || err == sql.ErrNoRows {
+    fmt.Println("Please call setup first")
+    os.Exit(0)
+  }
+  username, err := db.get_encrypted_setting(e, "username")
+  if(err != nil) {
+    log.Fatal(err)
+  }
+  password, err := db.get_encrypted_setting(e, "password")
+  if(err != nil) {
+    log.Fatal(err)
+  }
+
+  if !login(string(username), string(password)) {
+    log.Fatal("Fehler beim anmelden")
+  }
+
+
+  var resp string
+  startDate := time.Now()
+  startDate = startDate.AddDate(0, 0, -7)
+  endDate := time.Now()
+  endDate = endDate.AddDate(0, 6, 0)
+  v := url.Values{}
+  v.Set("startdt", startDate.Format("02.01.2006"))
+  v.Set("enddt", endDate.Format("02.01.2006"))
+
+  resp, _, _ = request("get", baseUrl + calPath, client, v)
+
+  dir, _ := db.get_setting("dir")
+
+  // open output file
+  fo, err := os.Create(dir+"/"+username+".ics")
+  if err != nil {
+      log.Fatal(err)
+  }
+  // close fo on exit and check for its returned error
+  defer func() {
+      if err := fo.Close(); err != nil {
+          log.Fatal(err)
+      }
+  }()
+  processData(fo, resp)
+}
+
+
+func processData(fo *os.File, resp string) {
+  w := bufio.NewWriter(fo)
+
+  var address Room
+  var err error
+  var category string
+  lines := strings.Split(resp, "\r\n")
+  for _,line := range lines {
+    if len(strings.TrimSpace(line)) != 0 {
+      if j := strings.Index(line, ":"); j >= 0 {
+        key, value := line[:j], line[j+1:]
+        switch key {
+          case "END":
+            if value == "VEVENT" {
+              address = Room{}
+              category = ""
+            }
+            break
+          case "CATEGORIES":
+            category = value
+            break
+          case "LOCATION":
+            var reg = regexp.MustCompile(`^([0-9]+\|[0-9]+)`)
+            if matches := reg.FindAllString(value, -1); len(matches) != 0 {
+              room := matches[0]
+              address, err = db.get_address(room)
+
+              if err == sql.ErrNoRows {
+                address = crawl_address(room)
+                db.set_address(room, address)
+              }
+
+              if address.address != "" {
+                value = address.address + ", Aachen"
+              }
+            }
+            break
+          case "DESCRIPTION":
+            additional := value
+            value = ""
+            if address.building != "" || address.building_no != "" {
+              value += "\nGebäude: " +  address.building_no + " " + address.building
+            }
+            if address.room != "" || address.room_no != "" {
+              value += "\nRaum: " +  address.room_no + " " + address.room
+            }
+            if address.floor != "" {
+              value += "\nGeschoss: " +  address.floor
+            }
+            if address.cluster != "" {
+              value += "\nCampus: " +  address.floor
+            }
+            if category != "" {
+              value += "\nTyp: " + category
+            }
+            if additional != "" && additional != "Kommentar" {
+              value += "\n"+additional
+            }
+            break
+        }
+        fmt.Fprint(w, key + ":" + strings.TrimSpace(value))
+      }
+    }
+    fmt.Fprint(w, "\r\n")
+  }
+  w.Flush()
+}
 
 func request(method string, url string, cl *http.Client, params url.Values) (string, http.Header, http.Request) {
 
@@ -230,32 +334,7 @@ func request(method string, url string, cl *http.Client, params url.Values) (str
 
 }
 
-func get_address (db *sql.DB, r string) (result Room) {
-    stmt, err := db.Prepare("SELECT * FROM rooms WHERE id = ?")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer stmt.Close()
-    result = Room{}
-    err = stmt.QueryRow(r).Scan(&result.id, &result.address, &result.cluster, &result.building, &result.building_no, &result.room, &result.room_no, &result.floor)
-    if err != nil {
-        log.Fatalf("Error running %q: %v", stmt, err)
-        spew.Dump(stmt)
-    }
-    return result
-}
-func set_address (db *sql.DB, room string, address Room) {
-    stmt, err := db.Prepare("INSERT OR REPLACE INTO rooms (id, address, cluster, building, building_no, room, room_no, floor) values (?, ?, ?, ?, ?, ?, ?, ?)")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer stmt.Close()
-    _, err = stmt.Exec(room, address.address, address.cluster, address.building, address.building_no, address.room, address.room_no, address.floor)
-    if err != nil {
-        log.Fatal(err)
-    }
-    return
-}
+
 
 func crawl_address (room string) (matches Room) {
     resp, _, _ := request("GET", baseUrl + roomPath, client, url.Values{"room": {room}})
